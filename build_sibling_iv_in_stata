@@ -1,0 +1,325 @@
+/*********************************************************************************************
+Econ 588 Project
+Zachary Flynn
+
+Purpose: Get the mean sibling age of marriage for each relevant indivdual that we can link from 1930 to 1940. This will require going to back to 1900 to get realtional data. Also, because certian people are more likley to be linked than others, we create a weight for the likliyhood of being linked so our eventual regression is more representative. 
+
+
+Last Edited: 17 April 2024
+*********************************************************************************************/
+
+// In order to calculate weights of people we need to reduce our data set down to only the people we care about, and then calculate the links off of which of those link to 1940. If you are a child in 1930 we cannot see an agemarr that we care about so we start by dropping all children. We also only care about people who we can find a sibling for.
+ssc install savesome
+set max_memory 200g
+global vdrive_data_output "V:\FHSS-JoePriceResearch\papers\current\early_marriage\data_files"
+
+*** Load in our age variable to cut down our data before merging 
+use "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_age.dta", clear 
+***Drop kids
+drop if age < 18 // (43,049,884 observations deleted)
+***Merge in agemarr 
+merge 1:1 serial1930 pernum1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_agemarr.dta", nogen keep(1 3)
+
+
+/*********************************************************************************************
+Link people back from 1930
+*********************************************************************************************/
+***Merge in histid1930 so we can use the cesus tree
+merge 1:1 serial1930 pernum1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_histid1930.dta", nogen keep(1 3)
+
+***Use Census Tree to go backwards
+foreach year in 1900 1910 1920 {
+	merge m:1 histid1930 using "V:\FHSS-JoePriceResearch\data\census_tree\census_tree_2023\/`year'_1930.dta", nogen keep(1 3)
+	egen methods = rowtotal(clp mlp xgb family_tree direct_hint profile_hint implied)
+	replace histid`year' = "" if methods<2 | (clp==1 & implied==1 & methods==2)
+	drop clp mlp xgb family_tree direct_hint profile_hint implied methods
+}
+
+*** merge in serial pernum for years other than 1930
+foreach year in 1900 1910 1920 {
+	merge m:1 histid`year' using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_`year'\serialpernum`year'_histid`year'.dta", nogen keep(1 3)
+}
+
+save "${vdrive_data_output}/backwards_merged.dta", replace
+
+
+/*********************************************************************************************
+Link people back from 1930
+*********************************************************************************************/
+
+*** We split up the data into 200 equal groups because the data is too big and stata won't load it
+gen group = ceil(200 *_n/_N)
+forvalues wack = 1/200 {
+savesome if group == `wack' using "${vdrive_data_output}/split_up_data\before_serial_reshape/group`wack'.dta", replace
+drop if group == `wack'
+}
+
+*** Merge in realtion to the head of household so we can get sibling information. We also merge in serial pernum reshaped wide so that each indivdual has each of thier family members on one line. We will reshape long later.
+forvalues wack = 1/200 {
+	use "${vdrive_data_output}/split_up_data\before_serial_reshape/group`wack'.dta", clear
+	forvalues year = 1900(10)1930 {
+		merge m:1 serial`year' pernum`year' using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_`year'\serialpernum`year'_related.dta", nogen keep(1 3)
+		rename related related`year'
+		merge m:1 serial`year' using "V:\FHSS-JoePriceResearch\RA_work_folders\Zachary_Flynn\ok_wealth_shock\Census_tree\reshape_serial\serial`year'.dta", nogen keep(1 3)
+	}
+	save "${vdrive_data_output}/split_up_data\serial_reshape/group`wack'.dta"
+}
+
+*** Make it so each person is going to have a newfam variable and a sibling order. Newfam will take a person and reshape thier family so each indovdual personin paced in a family with thier siblings, we reshape long again and it makes it so that each person has a 0 for thier sibling order making them the "focuse" person. All this means each indvidual gets thier own family variable, so a family that has siblings in this data will have a newfam var and a sibling order var created for each siblig in that family. 
+forvalues wack = 1/200 {
+use "${vdrive_data_output}/split_up_data\serial_reshape/group`wack'.dta", clear
+
+rename (serial1930 pernum1930 agemarr histid1930 histid1900 histid1910 histid1920 serial1900 pernum1900 serial1910 pernum1910 serial1920 pernum1920 related1900 related1910 related1920 related1930 age) (serial19300 pernum19300 agemarr0 histid19300 histid19000 histid19100 histid19200 serial19000 pernum19000 serial19100 pernum19100 serial19200 pernum19200 related19000 related19100 related19200 related19300 age0)
+*** We will need these variables again later but with the reshapes all of these variables get confusing with what they apply to, so we drop them for now. 
+drop pernum* serial* related* age* agemarr*
+
+gen double newfam = _n
+reshape long histid1900 histid1910 histid1920 histid1930, i(newfam) j(siblingorder)
+
+gen double newperson = _n
+reshape long histid, i(newperson) j(year)
+
+save "${vdrive_data_output}/split_up_data\serial_reshape/group`wack'.dta", replace
+}
+
+
+*** Merge in 1930 histids 
+forvalues wack = 1/200{
+	use "${vdrive_data_output}/split_up_data\serial_reshape/group`wack'.dta", clear
+	drop if histid == ""
+	forvalues year = 1900(10)1920 {
+		rename histid histid`year'
+		merge m:1 histid`year' using "V:\FHSS-JoePriceResearch\data\census_tree\census_tree_2023\/`year'_1930.dta", nogen update keep(1 3 4 5)
+		rename histid`year' histid 
+	}
+	save "${vdrive_data_output}/split_up_data\complete\group`wack'.dta", replace 
+}
+
+*** Make sure already present 1930 histid's are saved and get agemarr
+forvalues wack = 1/200{
+	use"${vdrive_data_output}/split_up_data\complete\group`wack'.dta", clear
+	egen methods = rowtotal(clp mlp xgb family_tree direct_hint profile_hint implied)
+	replace histid1930 = "" if methods<2 | (clp==1 & mlp==1 & methods==2)
+	drop clp mlp xgb family_tree direct_hint profile_hint implied methods
+	
+	replace histid1930 = histid if year == 1930
+	merge m:1 histid1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_histid1930.dta", nogen keep(1 3)
+	merge m:1 serial1930 pernum1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_agemarr.dta", nogen keep(1 3)
+	save "${vdrive_data_output}/split_up_data\complete\group`wack'.dta", replace
+}
+
+
+*** Get the mean sibling age of marriage
+forvalues wack = 1/200{
+	use "${vdrive_data_output}/split_up_data\complete\group`wack'.dta", clear
+
+	sort histid1930
+	drop if histid1930 == histid1930[_n-1]
+	
+	sort newfam siblingorder
+	gen has_sib = (newfam == newfam[_n-1]) | (newfam == newfam[_n+1])
+	
+	gen focus_agemarr = agemarr
+	replace focus_agemarr = . if siblingorder != 0
+	replace agemarr = . if siblingorder == 0 | agemarr == 0
+	bys newfam: egen mean_sibagemarr = mean(agemarr)
+	drop if siblingorder != 0
+	replace agemarr = focus_agemarr
+	drop focus_agemarr histid newperson year newfam siblingorder group 
+	save "${vdrive_data_output}/split_up_data\complete\focus_only_group`wack'.dta", replace
+}
+
+
+clear 
+*** append all the groups together
+forvalues wack = 1/200{
+	app using "${vdrive_data_output}/split_up_data\complete\focus_only_group`wack'.dta"
+}
+
+*** get 1940 info again
+merge m:1 histid1930 using "V:\FHSS-JoePriceResearch\data\census_tree\census_tree_2023\1930_1940.dta", nogen keep(3)
+
+*** not needed but better safe than sorry
+egen methods = rowtotal(clp mlp xgb family_tree direct_hint profile_hint implied)
+replace histid1940 = "" if methods<2 | (clp==1 & mlp==1 & methods==2)
+drop clp mlp xgb family_tree direct_hint profile_hint implied methods
+
+
+*** get serial & pernum
+merge m:1 histid1940 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1940\serialpernum1940_histid1940.dta", nogen keep(3)
+
+*** Get the vars we care about from 1940 (most variables that may vary across years come from here since 1940 is the year that we look at income in).
+foreach var in incwage educd empstat ind1950 occ1950 age nchild classwkr bpl hrswork1 {
+	merge m:1 serial1940 pernum1940 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1940\serialpernum1940_`var'.dta", nogen keep(1 3)
+}
+rename empstat empstat1940
+
+foreach var in placenhg hhsize  {
+	merge m:1 serial1940 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1940\serial1940_`var'.dta", nogen keep(1 3)
+}
+
+
+*** get 1930 vars
+foreach var in empstat race vet1930 sex{
+	merge m:1 serial1930 pernum1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_`var'.dta", nogen keep(1 3)
+}
+foreach var in countynhg {
+	merge m:1 serial1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serial1930_`var'.dta", nogen keep(1 3)
+}
+rename empstat empstat1930
+
+
+
+/*******************************************************************************
+Clean all of the covariates so they work for the regression
+*******************************************************************************/
+
+*** make educ represent years in school instead of whatever this monstrsity Ipums came up with
+recode educd (2=0) (12=1) (14=2) (15=3) (16=4) (17=5) (22=6) (23=7) (25=8) (26=9) (30=10) (40=11) (50=12) (60=13) (70=14) (80=15) (90=16) (100=17) (110=18) (111=19) (112=20) (113=21) (999=.)
+gen educ_sqred = educd^2
+
+*** These wages are coded as N/A
+replace incwage = . if incwage > 6000
+
+
+*** Make binaries of variables we care about
+gen vet = ( vet1930 != 0 & vet1930 != 8)
+gen emp1930 = (empstat1930 == 1)
+gen emp1940 = (empstat1940 == 1)
+gen in_labor_force1930 = (empstat1930 != 3)
+gen in_labor_force1940 = (empstat1940 != 3)
+gen female = (sex == 2)
+gen age_sqred = age^2
+gen self_emp = (classwkr == 1)
+
+
+***Make o inc wage small so lnwage is not set to missing
+replace incwage = 0.001 if incwage == 0
+gen lnwage = ln(incwage)
+
+replace mean_sibagemarr = round(mean_sibagemarr, 2)
+
+save "${vdrive_data_output}\final_data\all_people_final.dta", replace
+
+
+/***************************************************************************
+Making weights for who gets linked
+***************************************************************************/
+
+***get everyone who could be linked
+use "${vdrive_data_output}/backwards_merged.dta", clear 
+keep serial1930 pernum1930 histid1930
+merge 1:1 serial1930 pernum1930 using "${vdrive_data_output}\final_data\all_people_final.dta", nogen keep(1 3)
+
+***keep only the people who could possibly be in our analysis
+drop if has_sib == 1 & mean_sibagemarr == . //(14,291,017 observations deleted)
+gen link = (histid1940 != "") & (has_sib == 1)
+keep serial1930 pernum1930 histid1930 histid1940 link has_sib mean_sibagemarr
+
+
+***Grab covariates that effect someone's likleyhood of being linked
+foreach var in bpl related occ1950 age fbpl mbpl marst race sex{
+	merge m:1 serial1930 pernum1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serialpernum1930_`var'.dta", nogen keep(1 3)
+}
+foreach var in statefip farm city region{
+	merge m:1 serial1930 using "V:\FHSS-JoePriceResearch\data\census_data\ipums\ipums_1930\serial1930_`var'.dta", nogen keep(1 3)
+}
+merge m:1 city using "V:\FHSS-JoePriceResearch\RA_work_folders\Zachary_Flynn\census_raw\city_pop_1930.dta", nogen keep(1 3)
+//make age bins
+forvalues wack = 5(5)100 {
+	gen age_`wack' = age < `wack' & age >= `wack' - 5
+}
+gen f_foreign  = fbpl > 99
+gen m_foreign = mbpl > 99
+gen same_as_bpl = (statefip == bpl)
+drop city age_101
+
+*** Run a probit model to predict liklehood of getting linked 
+probit link i.bpl i.related i.occ1950 i.marst i.race i.sex i.statefip i.farm pop age_* f_foreign m_foreign same_as_bpl
+predict link_hat
+
+*** Generate the weight as specified in the paper: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7523567/
+count if link == 1
+gen weight = ((1 - link_hat)/link_hat)* ((r(N)/_N)/(1-(r(N)/_N)))
+
+*** Save the weighted matrix and only the people we can use the in regression
+save "${vdrive_data_output}\weights\full_weights.dta", replace 
+keep serial1930 pernum1930 weight
+merge 1:1 serial1930 pernum1930 using "${vdrive_data_output}\final_data\all_people_final.dta", nogen keep(3)
+drop if mean_sibagemarr == .
+drop if agemarr == .
+*** We need placenhg to not be a string so this is a numaric version of it. 
+merge m:1 placenhg using "V:\FHSS-JoePriceResearch\RA_work_folders\Zachary_Flynn\census_raw\id_placenhg.dta", nogen keep(1 3)
+save "${vdrive_data_output}\final_data\final.dta", replace
+
+
+
+
+
+
+
+
+
+
+***11mil observations takes forever to run so we are doing a sample of a million to save on time.
+gen num = runiformint(1,11000000)
+sort num 
+keep in 1/1000000
+drop num 
+
+save "${vdrive_data_output}\final_data\final_1mil.dta", replace
+
+
+
+/**************************************************************************************************
+Make the IV Maps
+**************************************************************************************************/
+use "${vdrive_data_output}\final_data\final.dta", clear
+
+ssc install shp2dta
+ssc install spmap
+ssc install geo2xy
+ssc install palettes
+ssc install colrspace
+ssc install schemepack
+ssc install outreg2
+ssc install ivreg2
+ssc install ranktest
+ssc install parmest
+ssc install ivreg2
+ssc install ranktest
+
+*** Get avgerages of all our binaries and other controles per county. z* will be the ind fixed effect
+collapse (firstnm) statefip (mean) agemarr mean_sibagemarr, by(countynhg)
+label values statefip statefip_lbl 
+
+*** spmap needs a unique id
+sort countynhg
+gen _ID = _n
+
+save "${vdrive_data_output}\final_data\final_collapsed.dta", replace
+
+
+*** Open the shape files and merge on agemarr and sibagemarr
+use ${shape_merge}, clear
+merge m:1 countynhg using "data/finaldata_collapse.dta", keep(1 3) nogen
+
+format agemarr %10.1f // this is graph-only
+format mean_sibagemarr %10.1f
+
+*** Make a pretty map and save it
+sort _ID
+colorpalette #bdd7e7 #d7b7a1 #f0975a #f24f0a, ipolate(4) nograph // low light blue to high orange in 4
+local colors `r(p)'
+graph set window fontface "Helvetica"
+
+***Save the outpus for this to box
+cd "C:\Users\zachh\Box\School\Current\Econ 588\project/"
+*** U.S. map for agemarr
+spmap agemarr using ${shapes}, id(_ID) fcolor("`colors'") legtitle("{bf: Age}") legend(position(7) size(3) bmargin(medium) rowgap(*2.5)) clmethod(custom) clbreaks(20.3 22.2 22.9 23.5 27.3) ocolor(gs1 ...) osize(vthin ...) ndfcolor("245 245 245" ...) ndocolor(gs1 ...) ndsize(vthin ...) title("Mean Sibling Age of Marriage")
+graph export "output/agemarr.png", as(png) width(1080) replace
+
+*** U.S. map for sibagemarr
+spmap mean_sibagemarr using ${shapes}, id(_ID) fcolor("`colors'") legtitle("{bf: Age}") legend(position(7) size(3) bmargin(medium) rowgap(*2.5)) clmethod(custom) clbreaks(20.3 22.2 22.9 23.5 27.3) ocolor(gs1 ...) osize(vthin ...) ndfcolor("245 245 245" ...) ndocolor(gs1 ...) ndsize(vthin ...) title("Mean Sibling Age of Marriage")
+graph export "output/sibagemarr.png", as(png) width(1080) replace
+
